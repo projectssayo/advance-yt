@@ -1,14 +1,10 @@
 FROM python:3.11-slim
 
-# Install system dependencies for Playwright
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Playwright dependencies
-RUN apt-get update && apt-get install -y \
     libnss3 \
     libnspr4 \
     libatk1.0-0 \
@@ -28,14 +24,29 @@ RUN apt-get update && apt-get install -y \
     libpango-1.0-0 \
     libcairo2 \
     libasound2 \
+    fonts-liberation \
+    libappindicator3-1 \
+    libxtst6 \
+    xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# Copy requirements first for better caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN playwright install chromium
 
+# Install Playwright
+RUN playwright install chromium
+RUN playwright install-deps
+
+# Copy application code
 COPY . .
+
+# Create non-root user
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 10000
 
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
