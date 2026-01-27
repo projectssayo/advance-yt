@@ -1,9 +1,4 @@
 __pycache__/
-*.pyc
+.venv/
 .env
-venv/
-env/
-.vscode/
-.DS_Store
-playwright-report/
-test-results/
+cloudinary.json
