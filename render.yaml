@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: yt-playlist-scraper
-    env: python
-    plan: free
-    buildCommand: |
-      pip install -r requirements.txt
-      playwright install chromium
-    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
