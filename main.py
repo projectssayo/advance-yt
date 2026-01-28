@@ -1,22 +1,22 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 import asyncio
 import aiohttp
 import hashlib
 import time
 from urllib.parse import urlparse, parse_qs
 
-app = FastAPI(title="YouTube Playlist API")
+app = FastAPI()
 
-class YouTubeAPI:
+class YouTubeExtractor:
     def __init__(self):
         self.yt_key = "AIzaSyA9duSdozs7H8mPd1UI8plqq73BxKkpI1g"
         self.cloud_name = "dnssyb7hu"
         self.cloud_key = "546611568773363"
         self.cloud_secret = "VIwYmkPKwCMrqIBI18ickdChUK4"
-        self.demo_id = "PLGjplNEQ1it_oTvuLRNqXfz_v_0pq6unW"
-        self.page_limit = 50
-    
-    def get_time_str(self, iso):
+        self.demo_playlist_id = "PLGjplNEQ1it_oTvuLRNqXfz_v_0pq6unW"
+        self.max_per_page = 50
+
+    def human_time(self, iso):
         if not iso.startswith('PT'):
             return "0:00"
         
@@ -41,27 +41,28 @@ class YouTubeAPI:
         elif m:
             return f"{m}:{s:02d}"
         return f"0:{s:02d}"
-    
-    def get_id_from_url(self, url):
+
+    def get_playlist_id(self, url):
         try:
             parsed = urlparse(url)
             qs = parse_qs(parsed.query)
             return qs.get("list", [""])[0]
         except:
             return ""
-    
-    async def get_json(self, session, url, params):
-        clean = {k: v for k, v in params.items() if v}
-        async with session.get(url, params=clean) as r:
+
+    async def fetch(self, session, url, params):
+        params = {k: v for k, v in params.items() if v is not None}
+        async with session.get(url, params=params) as r:
             return await r.json()
-    
+
     async def upload_img(self, session, vid):
         try:
             ts = int(time.time())
             pid = f"yt/{vid}"
             src = f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg"
             
-            sig = hashlib.sha1(f"public_id={pid}&timestamp={ts}{self.cloud_secret}".encode()).hexdigest()
+            sig_str = f"public_id={pid}&timestamp={ts}{self.cloud_secret}"
+            sig = hashlib.sha1(sig_str.encode()).hexdigest()
 
             data = {
                 "file": src,
@@ -77,15 +78,15 @@ class YouTubeAPI:
         except:
             pass
 
-class BasicAPI(YouTubeAPI):
-    async def get_data(self, url):
-        pid = self.get_id_from_url(url)
+class BasicExtractor(YouTubeExtractor):
+    async def extract(self, url):
+        pid = self.get_playlist_id(url)
         if not pid:
             return {"status": "false", "data": []}
 
         async with aiohttp.ClientSession() as session:
-            # Get playlist
-            p_data = await self.get_json(
+            # Get playlist info
+            p_data = await self.fetch(
                 session,
                 "https://www.googleapis.com/youtube/v3/playlists",
                 {"part": "snippet,contentDetails", "id": pid, "key": self.yt_key}
@@ -97,57 +98,59 @@ class BasicAPI(YouTubeAPI):
             info = p_data["items"][0]["snippet"]
             stats = p_data["items"][0]["contentDetails"]
 
-            p_info = {
-                "name": info["title"],
-                "desc": info.get("description", ""),
-                "count": stats.get("itemCount", 0),
-                "creator": info.get("channelTitle", ""),
-                "creator_link": f"https://www.youtube.com/channel/{info.get('channelId','')}",
-                "created": info.get("publishedAt", ""),
-                "updated": ""
+            p_meta = {
+                "playlist_name": info["title"],
+                "playlist_description": info.get("description", ""),
+                "video_count": stats.get("itemCount", 0),
+                "created_by": info.get("channelTitle", ""),
+                "created_by_link": f"https://www.youtube.com/channel/{info.get('channelId','')}",
+                "created_on": info.get("publishedAt", ""),
+                "last_updated": ""
             }
 
-            # Get ALL video IDs
-            all_v_ids = []
-            all_dates = []
-            next_token = None
+            # Get all video IDs
+            v_ids = []
+            v_dates = []
+            token = None
             
             while True:
-                resp = await self.get_json(
+                resp = await self.fetch(
                     session,
                     "https://www.googleapis.com/youtube/v3/playlistItems",
                     {
                         "part": "contentDetails,snippet",
                         "playlistId": pid,
-                        "maxResults": self.page_limit,
-                        "pageToken": next_token,
+                        "maxResults": self.max_per_page,
+                        "pageToken": token,
                         "key": self.yt_key
                     }
                 )
                 
                 for item in resp.get("items", []):
-                    all_v_ids.append(item["contentDetails"]["videoId"])
-                    all_dates.append(item["contentDetails"].get("videoPublishedAt", ""))
+                    v_ids.append(item["contentDetails"]["videoId"])
+                    v_dates.append(item["contentDetails"].get("videoPublishedAt", ""))
                 
-                next_token = resp.get("nextPageToken")
-                if not next_token:
+                token = resp.get("nextPageToken")
+                if not token or len(v_ids) >= 300:
                     break
 
-            # Get last date
-            if all_dates:
-                dates = [d for d in all_dates if d]
+            # Get last updated date
+            if v_dates:
+                dates = [d for d in v_dates if d]
                 if dates:
-                    p_info["updated"] = max(dates)
+                    p_meta["last_updated"] = max(dates)
 
-            # Get ALL video details
-            all_videos_data = []
-            
-            for i in range(0, len(all_v_ids), self.page_limit):
-                chunk = all_v_ids[i:i + self.page_limit]
+            # Limit to 300
+            v_ids = v_ids[:300]
+
+            # Get video details in chunks
+            all_videos = []
+            for i in range(0, len(v_ids), self.max_per_page):
+                chunk = v_ids[i:i + self.max_per_page]
                 if not chunk:
                     continue
                     
-                videos = await self.get_json(
+                videos = await self.fetch(
                     session,
                     "https://www.googleapis.com/youtube/v3/videos",
                     {
@@ -157,8 +160,7 @@ class BasicAPI(YouTubeAPI):
                     }
                 )
                 
-                # Store all videos
-                all_videos_data.extend(videos.get("items", []))
+                all_videos.extend(videos.get("items", []))
                 
                 # Upload thumbnails
                 tasks = []
@@ -167,37 +169,40 @@ class BasicAPI(YouTubeAPI):
                 
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Small delay
+                if i + self.max_per_page < len(v_ids):
+                    await asyncio.sleep(0.1)
 
-            # Build ONE single list
-            final_list = []
-            for idx, v in enumerate(all_videos_data, 1):
+            # Build result - matching exact schema
+            result = []
+            for idx, v in enumerate(all_videos, 1):
                 vid = v["id"]
-                final_list.append({
+                result.append({
                     "index": idx,
                     "video_id": vid,
                     "title": v["snippet"]["title"],
-                    "duration": self.get_time_str(v["contentDetails"]["duration"]),
+                    "duration": self.human_time(v["contentDetails"]["duration"]),
                     "video_link": f"https://www.youtube.com/watch?v={vid}",
-                    "thumb": f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg",
-                    "cloud_thumb": f"https://res.cloudinary.com/{self.cloud_name}/image/upload/yt/{vid}.jpg"
+                    "original_thumbnail": f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg",
+                    "thumbnail_247": f"https://res.cloudinary.com/{self.cloud_name}/image/upload/yt/{vid}.jpg"
                 })
 
             return {
                 "status": "true",
-                "playlist_info": p_info,
-                "total": len(final_list),
-                "data": final_list  # Single array with ALL videos
+                "playlist_info": p_meta,
+                "data": result
             }
 
-class AdvAPI(YouTubeAPI):
-    async def get_data(self, url):
-        pid = self.get_id_from_url(url)
+class AdvExtractor(YouTubeExtractor):
+    async def extract(self, url):
+        pid = self.get_playlist_id(url)
         if not pid:
             return {"status": "false", "data": []}
 
         async with aiohttp.ClientSession() as session:
-            # Get playlist
-            p_data = await self.get_json(
+            # Get playlist info
+            p_data = await self.fetch(
                 session,
                 "https://www.googleapis.com/youtube/v3/playlists",
                 {"part": "snippet,contentDetails", "id": pid, "key": self.yt_key}
@@ -209,57 +214,59 @@ class AdvAPI(YouTubeAPI):
             info = p_data["items"][0]["snippet"]
             stats = p_data["items"][0]["contentDetails"]
 
-            p_info = {
-                "name": info["title"],
-                "desc": info.get("description", ""),
-                "count": stats.get("itemCount", 0),
-                "creator": info.get("channelTitle", ""),
-                "creator_link": f"https://www.youtube.com/channel/{info.get('channelId','')}",
-                "created": info.get("publishedAt", ""),
-                "updated": ""
+            p_meta = {
+                "playlist_name": info["title"],
+                "playlist_description": info.get("description", ""),
+                "video_count": stats.get("itemCount", 0),
+                "created_by": info.get("channelTitle", ""),
+                "created_by_link": f"https://www.youtube.com/channel/{info.get('channelId','')}",
+                "created_on": info.get("publishedAt", ""),
+                "last_updated": ""
             }
 
-            # Get ALL video IDs
-            all_v_ids = []
-            all_dates = []
-            next_token = None
+            # Get all video IDs
+            v_ids = []
+            v_dates = []
+            token = None
             
             while True:
-                resp = await self.get_json(
+                resp = await self.fetch(
                     session,
                     "https://www.googleapis.com/youtube/v3/playlistItems",
                     {
                         "part": "contentDetails,snippet",
                         "playlistId": pid,
-                        "maxResults": self.page_limit,
-                        "pageToken": next_token,
+                        "maxResults": self.max_per_page,
+                        "pageToken": token,
                         "key": self.yt_key
                     }
                 )
                 
                 for item in resp.get("items", []):
-                    all_v_ids.append(item["contentDetails"]["videoId"])
-                    all_dates.append(item["contentDetails"].get("videoPublishedAt", ""))
+                    v_ids.append(item["contentDetails"]["videoId"])
+                    v_dates.append(item["contentDetails"].get("videoPublishedAt", ""))
                 
-                next_token = resp.get("nextPageToken")
-                if not next_token:
+                token = resp.get("nextPageToken")
+                if not token or len(v_ids) >= 300:
                     break
 
-            # Get last date
-            if all_dates:
-                dates = [d for d in all_dates if d]
+            # Get last updated date
+            if v_dates:
+                dates = [d for d in v_dates if d]
                 if dates:
-                    p_info["updated"] = max(dates)
+                    p_meta["last_updated"] = max(dates)
 
-            # Get ALL video details
-            all_videos_data = []
-            
-            for i in range(0, len(all_v_ids), self.page_limit):
-                chunk = all_v_ids[i:i + self.page_limit]
+            # Limit to 300
+            v_ids = v_ids[:300]
+
+            # Get video details in chunks
+            all_videos = []
+            for i in range(0, len(v_ids), self.max_per_page):
+                chunk = v_ids[i:i + self.max_per_page]
                 if not chunk:
                     continue
                     
-                videos = await self.get_json(
+                videos = await self.fetch(
                     session,
                     "https://www.googleapis.com/youtube/v3/videos",
                     {
@@ -269,8 +276,7 @@ class AdvAPI(YouTubeAPI):
                     }
                 )
                 
-                # Store all videos
-                all_videos_data.extend(videos.get("items", []))
+                all_videos.extend(videos.get("items", []))
                 
                 # Upload thumbnails
                 tasks = []
@@ -279,75 +285,74 @@ class AdvAPI(YouTubeAPI):
                 
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Small delay
+                if i + self.max_per_page < len(v_ids):
+                    await asyncio.sleep(0.1)
 
-            # Build ONE single list with advanced data
-            final_list = []
-            for idx, v in enumerate(all_videos_data, 1):
+            # Build result - matching exact schema
+            result = []
+            for idx, v in enumerate(all_videos, 1):
                 vid = v["id"]
                 chan_id = v["snippet"].get("channelId", "")
                 chan_name = v["snippet"].get("channelTitle", "")
                 
-                final_list.append({
+                result.append({
                     "index": idx,
-                    "playlist_name": p_info["name"],
-                    "playlist_desc": p_info["desc"],
-                    "video_count": p_info["count"],
-                    "created_by": p_info["creator"],
-                    "created_by_link": p_info["creator_link"],
-                    "created_on": p_info["created"],
-                    "last_updated": p_info["updated"],
+                    "playlist_name": p_meta["playlist_name"],
+                    "playlist_description": p_meta["playlist_description"],
+                    "video_count": p_meta["video_count"],
+                    "created_by": p_meta["created_by"],
+                    "created_by_link": p_meta["created_by_link"],
+                    "created_on": p_meta["created_on"],
+                    "last_updated": p_meta["last_updated"],
                     "video": {
-                        "id": vid,
-                        "title": v["snippet"]["title"],
-                        "duration": self.get_time_str(v["contentDetails"]["duration"]),
-                        "likes": v["statistics"].get("likeCount", "0"),
+                        "video_id": vid,
+                        "video_title": v["snippet"]["title"],
+                        "video_duration": self.human_time(v["contentDetails"]["duration"]),
+                        "video_likes": v["statistics"].get("likeCount", "0"),
                         "views": v["statistics"].get("viewCount", "0"),
-                        "desc": v["snippet"].get("description", ""),
-                        "comments": v["statistics"].get("commentCount", "0"),
-                        "url": f"https://www.youtube.com/watch?v={vid}",
-                        "thumb": f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg",
-                        "channel": chan_name,
-                        "channel_url": f"https://www.youtube.com/channel/{chan_id}" if chan_id else ""
+                        "description": v["snippet"].get("description", ""),
+                        "number_of_comments": v["statistics"].get("commentCount", "0"),
+                        "video_url": f"https://www.youtube.com/watch?v={vid}",
+                        "video_thumbnail": f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg",
+                        "channel_name": chan_name,
+                        "channel_link": f"https://www.youtube.com/channel/{chan_id}" if chan_id else ""
                     }
                 })
 
             return {
                 "status": "true",
-                "playlist_info": p_info,
-                "total": len(final_list),
-                "data": final_list  # Single array with ALL videos
+                "playlist_info": p_meta,
+                "data": result
             }
 
-# Create API instances
-basic_api = BasicAPI()
-adv_api = AdvAPI()
+# Create instances
+basic = BasicExtractor()
+adv = AdvExtractor()
 
 @app.get("/")
 async def home():
     return {
-        "msg": "YouTube Playlist API",
-        "basic": "/basic?url=YOUR_URL",
-        "adv": "/adv?url=YOUR_URL",
-        "demo": "/info"
+        "msg": "YouTube Playlist Extractor",
+        "basic": "/basic?url=YOUR_PLAYLIST_URL",
+        "adv": "/adv?url=YOUR_PLAYLIST_URL",
+        "demo": "/info",
+        "limit": "300 videos max, 50 per API call"
     }
 
 @app.get("/basic")
 async def basic_extract(url: str):
-    result = await basic_api.get_data(url)
-    if result["status"] == "false":
-        raise HTTPException(status_code=400, detail="Invalid URL")
-    return result
+    return await basic.extract(url)
 
 @app.get("/adv")
 async def adv_extract(url: str):
-    result = await adv_api.get_data(url)
-    if result["status"] == "false":
-        raise HTTPException(status_code=400, detail="Invalid URL")
-    return result
+    return await adv.extract(url)
 
 @app.get("/info")
 async def info():
     return {
-        "basic_demo": f"/basic?url=https://youtube.com/playlist?list={basic_api.demo_id}",
-        "adv_demo": f"/adv?url=https://youtube.com/playlist?list={adv_api.demo_id}"
+        "basic_demo": f"/basic?url=https://youtube.com/playlist?list={basic.demo_playlist_id}",
+        "adv_demo": f"/adv?url=https://youtube.com/playlist?list={adv.demo_playlist_id}",
+        "status": "ok"
     }
